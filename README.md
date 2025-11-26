@@ -46,4 +46,10 @@ No modules.
 
 ## Outputs
 
-No outputs.
+| Name | Description |
+|------|-------------|
+| <a name="output_subnet_private_1a"></a> [subnet\_private\_1a](#output\_subnet\_private\_1a) | Id da Private Subnet 1a |
+| <a name="output_subnet_private_1b"></a> [subnet\_private\_1b](#output\_subnet\_private\_1b) | Id da Private Subnet 1b |
+| <a name="output_subnet_public_1a"></a> [subnet\_public\_1a](#output\_subnet\_public\_1a) | Id da Public Subnet 1a |
+| <a name="output_subnet_public_1b"></a> [subnet\_public\_1b](#output\_subnet\_public\_1b) | Id da Public Subnet 1b |
+| <a name="output_vpc_id"></a> [vpc\_id](#output\_vpc\_id) | ID da VPC |
