@@ -14,7 +14,7 @@ resource "aws_vpc" "minha_vpc" {
 
 # Correcao primeira issue
 resource "aws_flow_log" "example" {
-  log_destination      = "arn:aws:s3:::tiago-terraform-clc14"
+  log_destination      = "arn:aws:s3:::tiago-terraform-automation"
   log_destination_type = "s3"
   traffic_type         = "ALL"
   vpc_id               = aws_vpc.minha_vpc.id
@@ -191,4 +191,145 @@ resource "aws_nat_gateway" "nat_gw_1b" {
   # To ensure proper ordering, it is recommended to add an explicit dependency
   # on the Internet Gateway for the VPC.
   depends_on = [aws_internet_gateway.igw]
+}
+
+
+
+
+
+resource "aws_security_group" "alb_sg" {
+  name   = "alb-sg"
+  vpc_id = aws_vpc.minha_vpc.id
+
+  ingress {
+    from_port   = 80
+    to_port     = 80
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "alb-sg"
+  }
+}
+
+resource "aws_security_group" "ec2_sg" {
+  name   = "ec2-sg"
+  vpc_id = aws_vpc.minha_vpc.id
+
+  ingress {
+    from_port       = 80
+    to_port         = 80
+    protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "ec2-sg"
+  }
+}
+
+resource "aws_security_group" "rds_sg" {
+  name   = "rds-sg"
+  vpc_id = aws_vpc.minha_vpc.id
+
+  ingress {
+    from_port       = 5432
+    to_port         = 5432
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2_sg.id]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "rds-sg"
+  }
+}
+
+resource "aws_lb" "app_alb" {
+  name               = "app-alb"
+  internal           = false               # false = público
+  load_balancer_type = "application"
+  security_groups    = [aws_security_group.alb_sg.id]
+  subnets            = [
+    aws_subnet.public_subnet_1a.id,
+    aws_subnet.public_subnet_1b.id
+  ]
+
+  tags = {
+    Name = "app-alb"
+  }
+}
+
+resource "aws_lb_target_group" "app_tg" {
+  name     = "app-tg"
+  port     = 80
+  protocol = "HTTP"
+  vpc_id   = aws_vpc.minha_vpc.id
+
+  health_check {
+    path                = "/"
+    interval            = 30
+    timeout             = 5
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
+  }
+}
+
+resource "aws_lb_listener" "http" {
+  load_balancer_arn = aws_lb.app_alb.arn
+  port              = 80
+  protocol          = "HTTP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.app_tg.arn
+  }
+}
+
+resource "aws_db_instance" "app_db" {
+  identifier = "app-db"
+
+  engine         = "postgres"
+  engine_version = "18.1"
+  instance_class = "db.t3.micro" # barato p/ lab
+
+  allocated_storage = 20
+  storage_type      = "gp3"
+
+  db_name  = "appdb"
+  username = "adminuser"
+  password = "SenhaMuitoSegura123!"
+
+  db_subnet_group_name   = aws_db_subnet_group.rds_subnet_group.name
+  vpc_security_group_ids = [aws_security_group.rds_sg.id]
+
+  multi_az = true # PROD-like
+  publicly_accessible = false
+
+  skip_final_snapshot = true
+
+  tags = {
+    Name = "app-db"
+  }
 }

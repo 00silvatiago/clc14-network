@@ -22,3 +22,7 @@ output "subnet_private_1b" {
   description = "Id da Private Subnet 1b"
   value       = aws_subnet.private_subnet_1b.id
 }
+
+output "alb_dns" {
+  value = aws_lb.app_alb.dns_name
+}
