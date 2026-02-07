@@ -228,7 +228,6 @@ resource "aws_security_group" "ec2_sg" {
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
-    security_groups = [aws_security_group.alb_sg.id]
   }
 
   egress {
@@ -311,8 +310,8 @@ resource "aws_db_instance" "app_db" {
   identifier = "app-db"
 
   engine         = "postgres"
-  engine_version = "18.1"
-  instance_class = "db.t3.micro" # barato p/ lab
+  engine_version = "18.1" # A v18 ainda não é padrão em todas regiões, verifique se seu lab suporta. 16 é safe.
+  instance_class = "db.t3.micro"
 
   allocated_storage = 20
   storage_type      = "gp3"
@@ -324,12 +323,253 @@ resource "aws_db_instance" "app_db" {
   db_subnet_group_name   = aws_db_subnet_group.rds_subnet_group.name
   vpc_security_group_ids = [aws_security_group.rds_sg.id]
 
-  multi_az = true # PROD-like
+  # --- MUDANÇAS PARA VELOCIDADE ---
+  
+  # 1. Desative Multi-AZ. Isso corta o tempo de criação pela metade.
+  multi_az = false 
+
+  # 2. Desative backups automáticos. Evita que o RDS fique fazendo backup logo após ligar.
+  backup_retention_period = 0 
+
+  # 3. Permite acesso público? Se for false, certifique-se que está acessando via EC2/VPN.
   publicly_accessible = false
 
+  # 4. Pula snapshot final ao destruir (já estava true, mantive).
   skip_final_snapshot = true
+
+  # 5. Aplica qualquer mudança imediatamente sem esperar janela de manutenção.
+  apply_immediately = true
 
   tags = {
     Name = "app-db"
   }
 }
+
+data "aws_ami" "amazon_linux" {
+  most_recent = true
+  owners      = ["amazon"]
+
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_key_pair" "lab_key" {
+  key_name   = "lab-key"
+  public_key = file("~/.ssh/id_rsa.pub")
+}
+
+resource "aws_instance" "app_1a" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.private_subnet_1a.id
+  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+  key_name      = aws_key_pair.lab_key.key_name
+
+  user_data = <<EOF
+#!/bin/bash
+yum install -y httpd
+systemctl enable httpd
+systemctl start httpd
+echo "EC2 1A OK" > /var/www/html/index.html
+EOF
+
+  tags = {
+    Name = "app-1a"
+  }
+}
+
+resource "aws_instance" "app_1b" {
+  ami           = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+  subnet_id     = aws_subnet.private_subnet_1b.id
+  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+  key_name      = aws_key_pair.lab_key.key_name
+
+  user_data = <<EOF
+#!/bin/bash
+yum install -y httpd
+systemctl enable httpd
+systemctl start httpd
+echo "EC2 1B OK" > /var/www/html/index.html
+EOF
+
+  tags = {
+    Name = "app-1b"
+  }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+resource "aws_lb_target_group_attachment" "tg_1a" {
+  target_group_arn = aws_lb_target_group.app_tg.arn
+  target_id        = aws_instance.app_1a.id
+  port             = 80
+}
+
+resource "aws_lb_target_group_attachment" "tg_1b" {
+  target_group_arn = aws_lb_target_group.app_tg.arn
+  target_id        = aws_instance.app_1b.id
+  port             = 80
+}
+
+resource "aws_launch_template" "app_lt" {
+  name_prefix   = "app-lt-"
+  image_id      = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+  key_name      = "minha-key"
+
+  vpc_security_group_ids = [aws_security_group.ec2_sg.id]
+
+  user_data = base64encode(file("${path.module}/script/node_exporter.sh"))
+
+  tag_specifications {
+    resource_type = "instance"
+    tags = {
+      Name        = "app-node"
+      Monitoring  = "node-exporter"
+    }
+  }
+}
+
+resource "aws_security_group_rule" "node_exporter" {
+  type              = "ingress"
+  from_port         = 9100
+  to_port           = 9100
+  protocol          = "tcp"
+  security_group_id = aws_security_group.ec2_sg.id
+}
+
+# Subnet Observability AZ1
+resource "aws_subnet" "obs_subnet_1a" {
+  vpc_id                  = aws_vpc.minha_vpc.id
+  cidr_block              = "10.0.50.0/24"
+  availability_zone       = "us-east-1a"
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name = "obs-subnet-1"
+  }
+}
+
+# Subnet Observability AZ2
+resource "aws_subnet" "obs_subnet_1b" {
+  vpc_id                  = aws_vpc.minha_vpc.id
+  cidr_block              = "10.0.51.0/24"
+  availability_zone       = "us-east-1b"
+  map_public_ip_on_launch = false
+
+  tags = {
+    Name = "obs-subnet-2"
+  }
+}
+
+resource "aws_route_table_association" "obs_rt_assoc_1a" {
+  subnet_id      = aws_subnet.obs_subnet_1a.id
+  route_table_id = aws_route_table.priv_rt_1a.id
+}
+
+resource "aws_route_table_association" "obs_rt_assoc_1b" {
+  subnet_id      = aws_subnet.obs_subnet_1b.id
+  route_table_id = aws_route_table.priv_rt_1b.id
+}
+
+resource "aws_security_group" "sg_obs" {
+  name        = "observability-sg"
+  description = "Prometheus and Grafana SG"
+  vpc_id      = aws_vpc.minha_vpc.id
+
+  # Grafana UI
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"] # depois restringir
+  }
+
+  # Prometheus UI
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # SSH
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  # saída total
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "sg-observability"
+  }
+}
+
+resource "aws_key_pair" "lab" {
+  key_name   = "terraform-lab"
+  public_key = file("~/.ssh/id_rsa.pub")
+}
+
+output "app_private_ips" {
+  value = [
+    aws_instance.app_1a.private_ip,
+    aws_instance.app_1b.private_ip
+  ]
+}
+
+data "template_file" "prometheus_config" {
+  template = file("${path.module}/script/prometheus.yml.tpl")
+
+  vars = {
+    ips = join("\n", [
+      for ip in [
+        aws_instance.app_1a.private_ip,
+        aws_instance.app_1b.private_ip
+      ] : ip
+    ])
+  }
+}
+
+
+resource "aws_instance" "observability" {
+  ami = data.aws_ami.amazon_linux.id
+  instance_type = "t3.micro"
+
+  subnet_id              = aws_subnet.private_subnet_1a.id
+  vpc_security_group_ids = [aws_security_group.sg_obs.id]
+  key_name = aws_key_pair.lab.key_name
+
+  user_data = <<EOF
+#!/bin/bash
+
+cat <<PROM > /tmp/prometheus.yml
+${data.template_file.prometheus_config.rendered}
+PROM
+EOF
+
+  tags = {
+    Name = "observability-server"
+  }
+}
+
