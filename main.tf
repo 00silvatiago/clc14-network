@@ -12,6 +12,17 @@ resource "aws_vpc" "minha_vpc" {
   }
 }
 
+resource "aws_key_pair" "lab" {
+  key_name   = "terraform-lab"
+  public_key = file("~/.ssh/id_rsa.pub")
+}
+
+variable "key_name" {
+  type        = string
+  default     = "terraform-lab"
+  description = "terraform-lab"
+}
+
 # Correcao primeira issue
 resource "aws_flow_log" "example" {
   log_destination      = "arn:aws:s3:::tiago-terraform-automation"
@@ -228,6 +239,7 @@ resource "aws_security_group" "ec2_sg" {
     from_port       = 80
     to_port         = 80
     protocol        = "tcp"
+    security_groups = [aws_security_group.alb_sg.id]
   }
 
   egress {
@@ -306,11 +318,12 @@ resource "aws_lb_listener" "http" {
   }
 }
 
+
 resource "aws_db_instance" "app_db" {
   identifier = "app-db"
 
   engine         = "postgres"
-  engine_version = "18.1" # A v18 ainda não é padrão em todas regiões, verifique se seu lab suporta. 16 é safe.
+  engine_version = "16" # Ajustado para uma versão compatível por padrão (16)
   instance_class = "db.t3.micro"
 
   allocated_storage = 20
@@ -355,17 +368,13 @@ data "aws_ami" "amazon_linux" {
   }
 }
 
-resource "aws_key_pair" "lab_key" {
-  key_name   = "lab-key"
-  public_key = file("~/.ssh/id_rsa.pub")
-}
 
 resource "aws_instance" "app_1a" {
   ami           = data.aws_ami.amazon_linux.id
   instance_type = "t3.micro"
   subnet_id     = aws_subnet.private_subnet_1a.id
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
-  key_name      = aws_key_pair.lab_key.key_name
+  key_name      = var.key_name
 
   user_data = <<EOF
 #!/bin/bash
@@ -385,7 +394,7 @@ resource "aws_instance" "app_1b" {
   instance_type = "t3.micro"
   subnet_id     = aws_subnet.private_subnet_1b.id
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
-  key_name      = aws_key_pair.lab_key.key_name
+  key_name      = var.key_name
 
   user_data = <<EOF
 #!/bin/bash
@@ -427,7 +436,7 @@ resource "aws_launch_template" "app_lt" {
   name_prefix   = "app-lt-"
   image_id      = data.aws_ami.amazon_linux.id
   instance_type = "t3.micro"
-  key_name      = "minha-key"
+  key_name      = var.key_name
 
   vpc_security_group_ids = [aws_security_group.ec2_sg.id]
 
@@ -442,134 +451,111 @@ resource "aws_launch_template" "app_lt" {
   }
 }
 
-resource "aws_security_group_rule" "node_exporter" {
-  type              = "ingress"
-  from_port         = 9100
-  to_port           = 9100
-  protocol          = "tcp"
-  security_group_id = aws_security_group.ec2_sg.id
-}
 
-# Subnet Observability AZ1
-resource "aws_subnet" "obs_subnet_1a" {
-  vpc_id                  = aws_vpc.minha_vpc.id
-  cidr_block              = "10.0.50.0/24"
-  availability_zone       = "us-east-1a"
-  map_public_ip_on_launch = false
 
-  tags = {
-    Name = "obs-subnet-1"
-  }
-}
 
-# Subnet Observability AZ2
-resource "aws_subnet" "obs_subnet_1b" {
-  vpc_id                  = aws_vpc.minha_vpc.id
-  cidr_block              = "10.0.51.0/24"
-  availability_zone       = "us-east-1b"
-  map_public_ip_on_launch = false
 
-  tags = {
-    Name = "obs-subnet-2"
-  }
-}
 
-resource "aws_route_table_association" "obs_rt_assoc_1a" {
-  subnet_id      = aws_subnet.obs_subnet_1a.id
-  route_table_id = aws_route_table.priv_rt_1a.id
-}
 
-resource "aws_route_table_association" "obs_rt_assoc_1b" {
-  subnet_id      = aws_subnet.obs_subnet_1b.id
-  route_table_id = aws_route_table.priv_rt_1b.id
-}
+# CloudFront Distribution
+resource "aws_cloudfront_distribution" "app_distribution" {
+  origin {
+    domain_name = aws_lb.app_alb.dns_name
+    origin_id   = "alb-origin"
 
-resource "aws_security_group" "sg_obs" {
-  name        = "observability-sg"
-  description = "Prometheus and Grafana SG"
-  vpc_id      = aws_vpc.minha_vpc.id
-
-  # Grafana UI
-  ingress {
-    from_port   = 3000
-    to_port     = 3000
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # depois restringir
+    custom_header {
+      name  = "User-Agent"
+      value = "CloudFront"
+    }
   }
 
-  # Prometheus UI
-  ingress {
-    from_port   = 9090
-    to_port     = 9090
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  enabled             = true
+  is_ipv6_enabled     = true
+  default_root_object = ""
+
+  default_cache_behavior {
+    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "alb-origin"
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+
+      headers = ["Host"]
+    }
+
+    viewer_protocol_policy = "redirect-to-https"
+    min_ttl                = 0
+    default_ttl            = 3600
+    max_ttl                = 86400
+    compress               = true
   }
 
-  # SSH
-  ingress {
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+  # Cache behavior for static assets
+  ordered_cache_behavior {
+    path_pattern     = "/static/*"
+    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
+    cached_methods   = ["GET", "HEAD"]
+    target_origin_id = "alb-origin"
+
+    forwarded_values {
+      query_string = false
+
+      cookies {
+        forward = "none"
+      }
+    }
+
+    viewer_protocol_policy = "https-only"
+    min_ttl                = 0
+    default_ttl            = 86400
+    max_ttl                = 31536000
+    compress               = true
   }
 
-  # saída total
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
   }
 
   tags = {
-    Name = "sg-observability"
+    Name = "app-cloudfront-distribution"
   }
+
+  depends_on = [aws_lb.app_alb]
 }
 
-resource "aws_key_pair" "lab" {
-  key_name   = "terraform-lab"
-  public_key = file("~/.ssh/id_rsa.pub")
+output "cloudfront_domain_name" {
+  value       = aws_cloudfront_distribution.app_distribution.domain_name
+  description = "CloudFront domain name para acessar a aplicação"
 }
 
-output "app_private_ips" {
-  value = [
-    aws_instance.app_1a.private_ip,
-    aws_instance.app_1b.private_ip
-  ]
-}
-
-data "template_file" "prometheus_config" {
-  template = file("${path.module}/script/prometheus.yml.tpl")
-
-  vars = {
-    ips = join("\n", [
-      for ip in [
-        aws_instance.app_1a.private_ip,
-        aws_instance.app_1b.private_ip
-      ] : ip
-    ])
-  }
-}
-
-
-resource "aws_instance" "observability" {
-  ami = data.aws_ami.amazon_linux.id
-  instance_type = "t3.micro"
-
-  subnet_id              = aws_subnet.private_subnet_1a.id
-  vpc_security_group_ids = [aws_security_group.sg_obs.id]
-  key_name = aws_key_pair.lab.key_name
-
-  user_data = <<EOF
-#!/bin/bash
-
-cat <<PROM > /tmp/prometheus.yml
-${data.template_file.prometheus_config.rendered}
-PROM
-EOF
+# Elastic IP para ALB
+resource "aws_eip" "alb_eip" {
+  domain = "vpc"
 
   tags = {
-    Name = "observability-server"
+    Name = "alb-eip"
   }
+
+  depends_on = [aws_internet_gateway.igw]
 }
 
+output "alb_elastic_ip" {
+  value       = aws_eip.alb_eip.public_ip
+  description = "IP Elástico do ALB"
+}
+
+output "alb_dns_name" {
+  value       = aws_lb.app_alb.dns_name
+  description = "DNS name do ALB"
+}
