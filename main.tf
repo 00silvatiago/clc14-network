@@ -382,6 +382,35 @@ yum install -y httpd
 systemctl enable httpd
 systemctl start httpd
 echo "EC2 1A OK" > /var/www/html/index.html
+
+
+# Install node-exporter
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz -O /tmp/node_exporter.tar.gz
+tar -xzf /tmp/node_exporter.tar.gz -C /opt/
+ln -s /opt/node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/node_exporter
+useradd --no-create-home --shell /bin/false node_exporter || true
+chown node_exporter:node_exporter /usr/local/bin/node_exporter
+
+# Create systemd service for node-exporter
+cat > /etc/systemd/system/node-exporter.service << 'SERVICE'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable node-exporter
+systemctl start node-exporter
 EOF
 
   tags = {
@@ -402,6 +431,34 @@ yum install -y httpd
 systemctl enable httpd
 systemctl start httpd
 echo "EC2 1B OK" > /var/www/html/index.html
+
+# Install node-exporter
+wget https://github.com/prometheus/node_exporter/releases/download/v1.6.1/node_exporter-1.6.1.linux-amd64.tar.gz -O /tmp/node_exporter.tar.gz
+tar -xzf /tmp/node_exporter.tar.gz -C /opt/
+ln -s /opt/node_exporter-1.6.1.linux-amd64/node_exporter /usr/local/bin/node_exporter
+useradd --no-create-home --shell /bin/false node_exporter || true
+chown node_exporter:node_exporter /usr/local/bin/node_exporter
+
+# Create systemd service for node-exporter
+cat > /etc/systemd/system/node-exporter.service << 'SERVICE'
+[Unit]
+Description=Node Exporter
+After=network.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/usr/local/bin/node_exporter
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable node-exporter
+systemctl start node-exporter
 EOF
 
   tags = {
@@ -457,105 +514,156 @@ resource "aws_launch_template" "app_lt" {
 
 
 
-# CloudFront Distribution
-resource "aws_cloudfront_distribution" "app_distribution" {
-  origin {
-    domain_name = aws_lb.app_alb.dns_name
-    origin_id   = "alb-origin"
 
-    custom_header {
-      name  = "User-Agent"
-      value = "CloudFront"
-    }
+
+
+
+
+# Security Group para Prometheus e Grafana
+resource "aws_security_group" "monitoring_sg" {
+  name   = "monitoring-sg"
+  vpc_id = aws_vpc.minha_vpc.id
+
+  # Prometheus
+  ingress {
+    from_port   = 9090
+    to_port     = 9090
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
-  enabled             = true
-  is_ipv6_enabled     = true
-  default_root_object = ""
-
-  default_cache_behavior {
-    allowed_methods  = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
-    cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "alb-origin"
-
-    forwarded_values {
-      query_string = false
-
-      cookies {
-        forward = "none"
-      }
-
-      headers = ["Host"]
-    }
-
-    viewer_protocol_policy = "redirect-to-https"
-    min_ttl                = 0
-    default_ttl            = 3600
-    max_ttl                = 86400
-    compress               = true
+  # Grafana
+  ingress {
+    from_port   = 3000
+    to_port     = 3000
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
-  # Cache behavior for static assets
-  ordered_cache_behavior {
-    path_pattern     = "/static/*"
-    allowed_methods  = ["GET", "HEAD", "OPTIONS"]
-    cached_methods   = ["GET", "HEAD"]
-    target_origin_id = "alb-origin"
-
-    forwarded_values {
-      query_string = false
-
-      cookies {
-        forward = "none"
-      }
-    }
-
-    viewer_protocol_policy = "https-only"
-    min_ttl                = 0
-    default_ttl            = 86400
-    max_ttl                = 31536000
-    compress               = true
+  # SSH
+  ingress {
+    from_port   = 22
+    to_port     = 22
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
-  restrictions {
-    geo_restriction {
-      restriction_type = "none"
-    }
+  # Permite node-exporter das EC2s
+  ingress {
+    from_port       = 9100
+    to_port         = 9100
+    protocol        = "tcp"
+    security_groups = [aws_security_group.ec2_sg.id]
   }
 
-  viewer_certificate {
-    cloudfront_default_certificate = true
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
   }
 
   tags = {
-    Name = "app-cloudfront-distribution"
+    Name = "monitoring-sg"
   }
-
-  depends_on = [aws_lb.app_alb]
 }
 
-output "cloudfront_domain_name" {
-  value       = aws_cloudfront_distribution.app_distribution.domain_name
-  description = "CloudFront domain name para acessar a aplicação"
-}
+# EC2 para Prometheus e Grafana
+resource "aws_instance" "monitoring" {
+  ami                    = data.aws_ami.amazon_linux.id
+  instance_type          = "t3.small"
+  subnet_id              = aws_subnet.public_subnet_1a.id
+  vpc_security_group_ids = [aws_security_group.monitoring_sg.id]
+  key_name               = var.key_name
 
-# Elastic IP para ALB
-resource "aws_eip" "alb_eip" {
-  domain = "vpc"
+  user_data = base64encode(<<-SCRIPT
+#!/bin/bash
+yum update -y
+yum install -y docker
+systemctl start docker
+systemctl enable docker
+usermod -aG docker ec2-user
+
+yum install -y python3-pip
+pip3 install docker-compose
+
+mkdir -p /opt/monitoring
+cd /opt/monitoring
+
+cat > docker-compose.yml << 'EOD'
+version: '3.8'
+services:
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:
+EOD
+
+cat > prometheus.yml << 'EOD'
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['10.0.1.10:9100', '10.0.2.10:9100']
+EOD
+
+docker-compose up -d
+SCRIPT
+  )
+  
 
   tags = {
-    Name = "alb-eip"
+    Name = "monitoring-server"
+  }
+
+  depends_on = [aws_instance.app_1a, aws_instance.app_1b]
+}
+
+# Elastic IP para Prometheus/Grafana
+resource "aws_eip" "monitoring_eip" {
+  instance = aws_instance.monitoring.id
+  domain   = "vpc"
+
+  tags = {
+    Name = "monitoring-eip"
   }
 
   depends_on = [aws_internet_gateway.igw]
 }
 
-output "alb_elastic_ip" {
-  value       = aws_eip.alb_eip.public_ip
-  description = "IP Elástico do ALB"
+output "prometheus_url" {
+  value       = "http://${aws_eip.monitoring_eip.public_ip}:9090"
+  description = "Prometheus UI URL"
 }
 
-output "alb_dns_name" {
-  value       = aws_lb.app_alb.dns_name
-  description = "DNS name do ALB"
+output "grafana_url" {
+  value       = "http://${aws_eip.monitoring_eip.public_ip}:3000"
+  description = "Grafana UI URL (admin/admin)"
 }
+
